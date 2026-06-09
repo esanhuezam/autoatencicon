@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-const fmt = (n) => "$\u00a0" + Number(n).toLocaleString("es-CL");
+const fmt = (n) => "$ " + Number(n).toLocaleString("es-CL");
 const ADMIN_PIN = "123456";
 
 const STORAGE_KEYS = {
@@ -9,52 +9,62 @@ const STORAGE_KEYS = {
   options:   "kiosk_option_overrides",
   promos:    "kiosk_promos",
   orders:    "kiosk_orders",
+  categories:"kiosk_categories",
+  homeImages:"kiosk_home_images",
 };
 
-// ── Storage ──────────────────────────────────────────────────────────────────
-// Los cambios se guardan en localStorage del navegador (el mismo que usa Chrome
-// en la tablet). Para que persistan entre recargas, el kiosco debe correr
-// siempre en el MISMO navegador/dispositivo (no en incógnito).
-//
-// Para restaurar configuración en otro dispositivo:
-// Panel Admin → Configuración → Exportar / Importar datos
+// ── Gist Sync — persiste entre dispositivos ──────────────────────────────────
+const GIST_ID    = "eceb5948ccae2a28b6fe0aeff9d84225";
+const GIST_TOKEN = "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";
+const GIST_FILE  = "nomade-kiosk-config.json";
 
 function loadJSON(key, fallback) {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
   catch { return fallback; }
 }
 function saveJSON(key, val) {
-  try { localStorage.setItem(key, JSON.stringify(val)); }
-  catch {}
+  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
 }
 
-// Exporta toda la configuración como archivo .json descargable
-export function exportConfig() {
-  const data = {};
-  for (const [name, key] of Object.entries(STORAGE_KEYS)) {
-    data[name] = loadJSON(key, null);
-  }
-  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement("a");
-  a.href     = url;
-  a.download = "nomade-kiosk-config-" + new Date().toISOString().slice(0,10) + ".json";
-  a.click();
-  URL.revokeObjectURL(url);
-}
-
-// Importa configuración desde archivo .json
-export function importConfig(jsonStr) {
+async function gistPull() {
   try {
-    const data = JSON.parse(jsonStr);
+    const res  = await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      headers: { Authorization: `token ${GIST_TOKEN}` },
+      cache: "no-store",
+    });
+    const json = await res.json();
+    const raw  = json.files?.[GIST_FILE]?.content;
+    if (!raw) return false;
+    const data = JSON.parse(raw);
     for (const [name, key] of Object.entries(STORAGE_KEYS)) {
-      if (data[name] !== undefined) saveJSON(key, data[name]);
+      if (data[name] !== undefined && data[name] !== null) {
+        localStorage.setItem(key, JSON.stringify(data[name]));
+      }
     }
     return true;
   } catch { return false; }
 }
 
-// ── Sub-components ────────────────────────────────────────────────────────────
+async function gistPush() {
+  const data = {};
+  for (const [name, key] of Object.entries(STORAGE_KEYS)) {
+    const v = localStorage.getItem(key);
+    data[name] = v ? JSON.parse(v) : null;
+  }
+  try {
+    await fetch(`https://api.github.com/gists/${GIST_ID}`, {
+      method: "PATCH",
+      headers: {
+        Authorization: `token ${GIST_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        files: { [GIST_FILE]: { content: JSON.stringify(data) } },
+      }),
+    });
+    return true;
+  } catch { return false; }
+}
 
 function PinScreen({ onSuccess, onCancel }) {
   const [pin, setPin] = useState("");
@@ -611,175 +621,386 @@ function PromosTab({ menu }) {
 }
 
 // ── Main AdminPanel ───────────────────────────────────────────────────────────
-// ── ConfigTab ─────────────────────────────────────────────────────────────────
-function ConfigTab() {
-  const [importStatus, setImportStatus] = useState(null);
-  const fileRef = useRef(null);
 
-  function handleExport() {
-    const data = {};
-    for (const [name, key] of Object.entries(STORAGE_KEYS)) {
-      const v = localStorage.getItem(key);
-      data[name] = v ? JSON.parse(v) : null;
-    }
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
-    const url  = URL.createObjectURL(blob);
-    const a    = document.createElement("a");
-    a.href     = url;
-    a.download = "nomade-kiosk-config-" + new Date().toISOString().slice(0,10) + ".json";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+// ── CategoriesTab ─────────────────────────────────────────────────────────────
+function CategoriesTab({ cats, setCats, menu }) {
+  const [editing, setEditing] = useState(null); // { idx, name, icon, img }
+  const [adding,  setAdding]  = useState(false);
+  const [newCat,  setNewCat]  = useState({ name:"", icon:"🍽", img:null });
+  const fileRef = useRef(null);
+  const addFileRef = useRef(null);
+
+  const CAT_ICONS_LIST = ["☕","🧋","🍫","🍹","🍵","🍦","🥐","🥪","🍕","🥗","🍰","🥤","🍔","✦"];
+
+  function saveAndPersist(newCats) {
+    setCats(newCats);
+    saveJSON(STORAGE_KEYS.categories, newCats);
   }
 
-  function handleImportFile(e) {
+  function handleImageUpload(e, isNew) {
     const file = e.target.files[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = (ev) => {
-      try {
-        const data = JSON.parse(ev.target.result);
-        let count = 0;
-        for (const [name, key] of Object.entries(STORAGE_KEYS)) {
-          if (data[name] !== undefined && data[name] !== null) {
-            localStorage.setItem(key, JSON.stringify(data[name]));
-            count++;
-          }
-        }
-        setImportStatus({ ok: true, msg: `✓ ${count} categorías importadas. Recarga para ver los cambios.` });
-      } catch {
-        setImportStatus({ ok: false, msg: "✗ Archivo inválido. Usa un archivo exportado desde este kiosco." });
-      }
+      if (isNew) setNewCat(c => ({ ...c, img: ev.target.result }));
+      else setEditing(c => ({ ...c, img: ev.target.result }));
     };
-    reader.readAsText(file);
+    reader.readAsDataURL(file);
   }
 
-  function handleReset() {
-    if (!window.confirm("¿Borrar toda la configuración guardada? Los productos vuelven al estado original.")) return;
-    for (const key of Object.values(STORAGE_KEYS)) {
-      localStorage.removeItem(key);
-    }
-    setImportStatus({ ok: true, msg: "✓ Configuración restablecida. Recarga la página." });
+  function saveEdit() {
+    if (!editing.name.trim()) return;
+    const updated = cats.map((c, i) => i === editing.idx
+      ? { ...c, nombre: editing.name, icon: editing.icon, img: editing.img }
+      : c
+    );
+    saveAndPersist(updated);
+    setEditing(null);
   }
 
-  const cardStyle = {
-    background: "#fff", borderRadius: 16, padding: "28px 28px",
-    marginBottom: 16, boxShadow: "0 2px 12px rgba(0,0,0,0.07)",
-    border: "1px solid #f0ebe3",
-  };
-  const btnStyle = (color) => ({
-    display: "inline-flex", alignItems: "center", gap: 8,
-    padding: "13px 24px", borderRadius: 12, border: "none",
-    background: color, color: "#fff", fontWeight: 700,
-    fontSize: 15, cursor: "pointer", marginRight: 12, marginTop: 8,
-  });
+  function deleteCategory(idx) {
+    const cat = cats[idx];
+    const inUse = menu.some(p => p.cat === cat.nombre);
+    if (inUse && !window.confirm(`La categoría "${cat.nombre}" tiene productos. ¿Eliminar de todas formas?`)) return;
+    saveAndPersist(cats.filter((_, i) => i !== idx));
+  }
+
+  function addCategory() {
+    if (!newCat.name.trim()) return;
+    saveAndPersist([...cats, { nombre: newCat.name, icon: newCat.icon, img: newCat.img }]);
+    setNewCat({ name:"", icon:"🍽", img:null });
+    setAdding(false);
+  }
+
+  const card = { background:"#fff", borderRadius:14, padding:"16px", marginBottom:12, border:"1px solid #f0ebe3", display:"flex", alignItems:"center", gap:14 };
+  const btn  = (bg, sm) => ({ background:bg, border:"none", color:"#fff", borderRadius:8, padding: sm ? "6px 12px" : "10px 18px", cursor:"pointer", fontWeight:600, fontSize: sm ? 12 : 13 });
 
   return (
-    <div style={{ padding: "24px 20px", maxWidth: 600, margin: "0 auto" }}>
-      <h2 style={{ fontFamily:"Georgia,serif", fontSize:22, color:"#1a0f08", marginBottom:24 }}>⚙️ Configuración</h2>
-
-      {/* Exportar */}
-      <div style={cardStyle}>
-        <h3 style={{ fontSize:16, fontWeight:700, color:"#1a0f08", marginBottom:8 }}>📥 Exportar configuración</h3>
-        <p style={{ fontSize:13, color:"#888", marginBottom:16, lineHeight:1.6 }}>
-          Guarda todos los cambios de precios, imágenes y promociones en un archivo .json.
-          Úsalo para restaurar en otro dispositivo o como respaldo.
-        </p>
-        <button onClick={handleExport} style={btnStyle("#3d2b1f")}>
-          📥 Descargar backup
-        </button>
+    <div style={{ padding:"20px", overflowY:"auto", height:"100%", maxWidth:600, margin:"0 auto" }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:20 }}>
+        <h2 style={{ fontFamily:"Georgia,serif", fontSize:20, color:"#1a0f08", margin:0 }}>🗂 Categorías</h2>
+        <button onClick={() => setAdding(true)} style={btn("#3d2b1f")}>+ Nueva categoría</button>
       </div>
 
-      {/* Importar */}
-      <div style={cardStyle}>
-        <h3 style={{ fontSize:16, fontWeight:700, color:"#1a0f08", marginBottom:8 }}>📤 Importar configuración</h3>
-        <p style={{ fontSize:13, color:"#888", marginBottom:16, lineHeight:1.6 }}>
-          Restaura una configuración guardada. Selecciona el archivo .json exportado anteriormente.
-          <br /><strong style={{ color:"#c0713a" }}>Los datos actuales serán reemplazados.</strong>
-        </p>
-        <button onClick={() => fileRef.current?.click()} style={btnStyle("#c0713a")}>
-          📤 Seleccionar archivo
-        </button>
-        <input ref={fileRef} type="file" accept=".json" onChange={handleImportFile}
-          style={{ display:"none" }} />
-        {importStatus && (
-          <div style={{
-            marginTop: 12, padding: "10px 16px", borderRadius: 10,
-            background: importStatus.ok ? "#e8f5e9" : "#fce4e4",
-            color: importStatus.ok ? "#2e7d32" : "#c62828",
-            fontSize: 13, fontWeight: 600,
-          }}>
-            {importStatus.msg}
+      {cats.map((cat, idx) => (
+        <div key={idx} style={card}>
+          {/* Imagen */}
+          <div style={{ width:56, height:56, borderRadius:12, overflow:"hidden", background:"#f5f0e8", flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center" }}>
+            {cat.img
+              ? <img src={cat.img} style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+              : <span style={{ fontSize:26 }}>{cat.icon}</span>
+            }
           </div>
-        )}
+          {/* Info */}
+          <div style={{ flex:1 }}>
+            <div style={{ fontWeight:700, fontSize:15, color:"#1a0f08" }}>{cat.icon} {cat.nombre}</div>
+            <div style={{ fontSize:12, color:"#aaa" }}>{menu.filter(p => p.cat === cat.nombre).length} productos</div>
+          </div>
+          {/* Actions */}
+          <div style={{ display:"flex", gap:8 }}>
+            <button onClick={() => setEditing({ idx, name:cat.nombre, icon:cat.icon, img:cat.img ?? null })} style={btn("#c0713a", true)}>Editar</button>
+            <button onClick={() => deleteCategory(idx)} style={btn("#e05a4a", true)}>Eliminar</button>
+          </div>
+        </div>
+      ))}
+
+      {/* Modal Editar */}
+      {editing && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:9999, display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <div style={{ background:"#fff", borderRadius:20, padding:28, width:340, maxWidth:"90vw" }}>
+            <h3 style={{ fontFamily:"Georgia,serif", fontSize:17, marginBottom:20 }}>Editar categoría</h3>
+            <label style={{ fontSize:13, color:"#666", display:"block", marginBottom:6 }}>Nombre</label>
+            <input value={editing.name} onChange={e => setEditing(c => ({...c, name: e.target.value}))}
+              style={{ width:"100%", padding:"10px 12px", borderRadius:10, border:"1px solid #ddd", fontSize:14, marginBottom:14, boxSizing:"border-box" }} />
+            <label style={{ fontSize:13, color:"#666", display:"block", marginBottom:6 }}>Icono</label>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:14 }}>
+              {CAT_ICONS_LIST.map(ic => (
+                <button key={ic} onClick={() => setEditing(c => ({...c, icon:ic}))}
+                  style={{ fontSize:20, padding:"6px 10px", borderRadius:8, border: editing.icon===ic ? "2px solid #3d2b1f" : "2px solid #eee", background: editing.icon===ic ? "#f5e6d0" : "#fff", cursor:"pointer" }}>
+                  {ic}
+                </button>
+              ))}
+            </div>
+            <label style={{ fontSize:13, color:"#666", display:"block", marginBottom:6 }}>Imagen</label>
+            {editing.img && <img src={editing.img} style={{ width:80, height:80, objectFit:"cover", borderRadius:10, marginBottom:8, display:"block" }} />}
+            <button onClick={() => fileRef.current?.click()} style={{ ...btn("#888", true), marginBottom:14 }}>
+              {editing.img ? "Cambiar imagen" : "Subir imagen"}
+            </button>
+            <input ref={fileRef} type="file" accept="image/*" onChange={e => handleImageUpload(e, false)} style={{ display:"none" }} />
+            <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
+              <button onClick={() => setEditing(null)} style={btn("#bbb")}>Cancelar</button>
+              <button onClick={saveEdit} style={btn("#3d2b1f")}>Guardar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal Nueva */}
+      {adding && (
+        <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", zIndex:9999, display:"flex", alignItems:"center", justifyContent:"center" }}>
+          <div style={{ background:"#fff", borderRadius:20, padding:28, width:340, maxWidth:"90vw" }}>
+            <h3 style={{ fontFamily:"Georgia,serif", fontSize:17, marginBottom:20 }}>Nueva categoría</h3>
+            <label style={{ fontSize:13, color:"#666", display:"block", marginBottom:6 }}>Nombre</label>
+            <input value={newCat.name} onChange={e => setNewCat(c => ({...c, name: e.target.value}))}
+              placeholder="Ej: Jugos"
+              style={{ width:"100%", padding:"10px 12px", borderRadius:10, border:"1px solid #ddd", fontSize:14, marginBottom:14, boxSizing:"border-box" }} />
+            <label style={{ fontSize:13, color:"#666", display:"block", marginBottom:6 }}>Icono</label>
+            <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:14 }}>
+              {CAT_ICONS_LIST.map(ic => (
+                <button key={ic} onClick={() => setNewCat(c => ({...c, icon:ic}))}
+                  style={{ fontSize:20, padding:"6px 10px", borderRadius:8, border: newCat.icon===ic ? "2px solid #3d2b1f" : "2px solid #eee", background: newCat.icon===ic ? "#f5e6d0" : "#fff", cursor:"pointer" }}>
+                  {ic}
+                </button>
+              ))}
+            </div>
+            <label style={{ fontSize:13, color:"#666", display:"block", marginBottom:6 }}>Imagen (opcional)</label>
+            {newCat.img && <img src={newCat.img} style={{ width:80, height:80, objectFit:"cover", borderRadius:10, marginBottom:8, display:"block" }} />}
+            <button onClick={() => addFileRef.current?.click()} style={{ ...btn("#888", true), marginBottom:14 }}>
+              {newCat.img ? "Cambiar imagen" : "Subir imagen"}
+            </button>
+            <input ref={addFileRef} type="file" accept="image/*" onChange={e => handleImageUpload(e, true)} style={{ display:"none" }} />
+            <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
+              <button onClick={() => { setAdding(false); setNewCat({ name:"", icon:"🍽", img:null }); }} style={btn("#bbb")}>Cancelar</button>
+              <button onClick={addCategory} style={btn("#3d2b1f")}>Agregar</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── HomeTab ───────────────────────────────────────────────────────────────────
+function HomeTab({ homeImages, setHomeImages }) {
+  const heroRef    = useRef(null);
+  const thumbsRefs = useRef([]);
+
+  function saveAndPersist(imgs) {
+    setHomeImages(imgs);
+    saveJSON(STORAGE_KEYS.homeImages, imgs);
+  }
+
+  function uploadHero(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => saveAndPersist({ ...homeImages, hero: ev.target.result });
+    reader.readAsDataURL(file);
+  }
+
+  function uploadThumb(e, idx) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const newThumbs = [...(homeImages.thumbs || [])];
+      newThumbs[idx] = ev.target.result;
+      saveAndPersist({ ...homeImages, thumbs: newThumbs });
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function removeThumb(idx) {
+    const newThumbs = (homeImages.thumbs || []).filter((_, i) => i !== idx);
+    saveAndPersist({ ...homeImages, thumbs: newThumbs });
+  }
+
+  function addThumbSlot() {
+    const input = document.createElement("input");
+    input.type = "file"; input.accept = "image/*";
+    input.onchange = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const newThumbs = [...(homeImages.thumbs || []), ev.target.result];
+        saveAndPersist({ ...homeImages, thumbs: newThumbs });
+      };
+      reader.readAsDataURL(file);
+    };
+    input.click();
+  }
+
+  const btn = (bg, sm) => ({ background:bg, border:"none", color:"#fff", borderRadius:8, padding: sm ? "6px 12px" : "10px 18px", cursor:"pointer", fontWeight:600, fontSize: sm ? 12 : 13 });
+  const card = { background:"#fff", borderRadius:14, padding:"20px", marginBottom:16, border:"1px solid #f0ebe3" };
+
+  return (
+    <div style={{ padding:"20px", overflowY:"auto", height:"100%", maxWidth:600, margin:"0 auto" }}>
+      <h2 style={{ fontFamily:"Georgia,serif", fontSize:20, color:"#1a0f08", marginBottom:20 }}>🖼 Imágenes del Home</h2>
+
+      {/* Hero */}
+      <div style={card}>
+        <h3 style={{ fontSize:15, fontWeight:700, color:"#1a0f08", marginBottom:12 }}>Foto principal (izquierda)</h3>
+        <div style={{ display:"flex", gap:16, alignItems:"center" }}>
+          <div style={{ width:120, height:90, borderRadius:12, overflow:"hidden", background:"#f5f0e8", flexShrink:0 }}>
+            {homeImages.hero
+              ? <img src={homeImages.hero} style={{ width:"100%", height:"100%", objectFit:"cover" }} />
+              : <div style={{ width:"100%", height:"100%", display:"flex", alignItems:"center", justifyContent:"center", color:"#ccc", fontSize:12 }}>Sin imagen</div>
+            }
+          </div>
+          <div>
+            <button onClick={() => heroRef.current?.click()} style={btn("#3d2b1f")}>
+              {homeImages.hero ? "Cambiar foto" : "Subir foto"}
+            </button>
+            {homeImages.hero && (
+              <button onClick={() => saveAndPersist({ ...homeImages, hero: null })} style={{ ...btn("#e05a4a", true), marginLeft:8 }}>Quitar</button>
+            )}
+            <input ref={heroRef} type="file" accept="image/*" onChange={uploadHero} style={{ display:"none" }} />
+            <p style={{ fontSize:12, color:"#aaa", marginTop:8, margin:"8px 0 0" }}>Recomendado: formato horizontal, alta resolución.</p>
+          </div>
+        </div>
       </div>
 
-      {/* Restablecer */}
-      <div style={cardStyle}>
-        <h3 style={{ fontSize:16, fontWeight:700, color:"#1a0f08", marginBottom:8 }}>🗑 Restablecer todo</h3>
-        <p style={{ fontSize:13, color:"#888", marginBottom:16, lineHeight:1.6 }}>
-          Borra toda la configuración guardada y vuelve al estado original del kiosco.
-        </p>
-        <button onClick={handleReset} style={btnStyle("#e05a4a")}>
-          🗑 Restablecer fábrica
-        </button>
-      </div>
-
-      {/* Info */}
-      <div style={{ ...cardStyle, background:"#fdf8f0", borderColor:"#e8d5b7" }}>
-        <h3 style={{ fontSize:15, fontWeight:700, color:"#8b6914", marginBottom:8 }}>ℹ️ Cómo funciona el almacenamiento</h3>
-        <p style={{ fontSize:13, color:"#a07830", lineHeight:1.7, margin:0 }}>
-          Los cambios se guardan en el navegador de <strong>este dispositivo</strong>.<br/>
-          Para usarlos en otra tablet: exporta el archivo aquí e impórtalo allá.<br/>
-          El modo incógnito tiene almacenamiento separado — no uses incógnito para el kiosco.
-        </p>
+      {/* Thumbnails */}
+      <div style={card}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:14 }}>
+          <h3 style={{ fontSize:15, fontWeight:700, color:"#1a0f08", margin:0 }}>Miniaturas (franja inferior)</h3>
+          <button onClick={addThumbSlot} style={btn("#3d2b1f", true)}>+ Agregar</button>
+        </div>
+        <div style={{ display:"flex", flexWrap:"wrap", gap:12 }}>
+          {(homeImages.thumbs || []).map((img, idx) => (
+            <div key={idx} style={{ position:"relative", width:72, height:72 }}>
+              <img src={img} style={{ width:72, height:72, objectFit:"cover", borderRadius:10, border:"1px solid #eee" }} />
+              <button onClick={() => uploadThumb(null, idx)}
+                style={{ position:"absolute", bottom:2, left:2, background:"rgba(0,0,0,0.55)", border:"none", color:"#fff", borderRadius:6, fontSize:10, padding:"2px 5px", cursor:"pointer" }}
+                onClick={() => { thumbsRefs.current[idx]?.click(); }}>✏️</button>
+              <button onClick={() => removeThumb(idx)}
+                style={{ position:"absolute", top:2, right:2, background:"rgba(220,60,60,0.85)", border:"none", color:"#fff", borderRadius:"50%", width:18, height:18, fontSize:11, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>×</button>
+              <input ref={el => thumbsRefs.current[idx] = el} type="file" accept="image/*"
+                onChange={e => uploadThumb(e, idx)} style={{ display:"none" }} />
+            </div>
+          ))}
+          {(homeImages.thumbs || []).length === 0 && (
+            <div style={{ color:"#bbb", fontSize:13 }}>Sin miniaturas. Agrega con el botón +.</div>
+          )}
+        </div>
       </div>
     </div>
   );
 }
 
 
-export default function AdminPanel({ onClose, menu, setMenu, productOptions, setProductOptions }) {
+// ── ConfigTab ─────────────────────────────────────────────────────────────────
+function ConfigTab() {
+  const [syncStatus, setSyncStatus] = useState(null);
+  const [syncing, setSyncing]       = useState(false);
+
+  async function handlePull() {
+    setSyncing(true); setSyncStatus(null);
+    const ok = await gistPull();
+    setSyncStatus(ok ? { ok:true,  msg:"✓ Datos sincronizados. Recarga la página para ver los cambios." }
+                     : { ok:false, msg:"✗ Error al sincronizar. Verifica la conexión." });
+    setSyncing(false);
+  }
+
+  async function handlePush() {
+    setSyncing(true); setSyncStatus(null);
+    const ok = await gistPush();
+    setSyncStatus(ok ? { ok:true,  msg:"✓ Cambios guardados en la nube. Ya visibles en otros dispositivos." }
+                     : { ok:false, msg:"✗ Error al guardar. Verifica la conexión." });
+    setSyncing(false);
+  }
+
+  function handleReset() {
+    if (!window.confirm("¿Borrar toda la configuración local? Los productos vuelven al estado original.")) return;
+    for (const key of Object.values(STORAGE_KEYS)) localStorage.removeItem(key);
+    setSyncStatus({ ok:true, msg:"✓ Configuración restablecida. Recarga la página." });
+  }
+
+  const card  = { background:"#fff", borderRadius:16, padding:"24px 24px", marginBottom:16, boxShadow:"0 2px 12px rgba(0,0,0,0.07)", border:"1px solid #f0ebe3" };
+  const btn   = (bg) => ({ display:"inline-flex", alignItems:"center", gap:8, padding:"12px 22px", borderRadius:12, border:"none", background:syncing?"#ccc":bg, color:"#fff", fontWeight:700, fontSize:14, cursor:syncing?"not-allowed":"pointer", marginRight:10, marginTop:8 });
+
+  return (
+    <div style={{ padding:"24px 20px", maxWidth:560, margin:"0 auto", overflowY:"auto", height:"100%" }}>
+      <h2 style={{ fontFamily:"Georgia,serif", fontSize:20, color:"#1a0f08", marginBottom:20 }}>⚙️ Configuración</h2>
+
+      <div style={card}>
+        <h3 style={{ fontSize:15, fontWeight:700, color:"#1a0f08", marginBottom:6 }}>☁️ Sincronización entre dispositivos</h3>
+        <p style={{ fontSize:13, color:"#888", marginBottom:14, lineHeight:1.6 }}>
+          Los cambios se guardan en la nube (GitHub Gist privado).<br/>
+          <strong>Subir</strong>: envía los cambios de esta tablet a la nube.<br/>
+          <strong>Bajar</strong>: descarga los últimos cambios desde la nube.
+        </p>
+        <button onClick={handlePush} style={btn("#3d2b1f")} disabled={syncing}>
+          {syncing ? "⏳ Procesando..." : "☁️ Subir cambios"}
+        </button>
+        <button onClick={handlePull} style={btn("#c0713a")} disabled={syncing}>
+          {syncing ? "⏳ Procesando..." : "⬇️ Bajar cambios"}
+        </button>
+        {syncStatus && (
+          <div style={{ marginTop:12, padding:"10px 14px", borderRadius:10, background:syncStatus.ok?"#e8f5e9":"#fce4e4", color:syncStatus.ok?"#2e7d32":"#c62828", fontSize:13, fontWeight:600 }}>
+            {syncStatus.msg}
+          </div>
+        )}
+      </div>
+
+      <div style={card}>
+        <h3 style={{ fontSize:15, fontWeight:700, color:"#1a0f08", marginBottom:6 }}>🗑 Restablecer</h3>
+        <p style={{ fontSize:13, color:"#888", marginBottom:14, lineHeight:1.6 }}>
+          Borra la configuración local de <strong>este dispositivo</strong>.
+        </p>
+        <button onClick={handleReset} style={btn("#e05a4a")}>🗑 Restablecer fábrica</button>
+      </div>
+
+      <div style={{ ...card, background:"#fdf8f0", borderColor:"#e8d5b7" }}>
+        <h3 style={{ fontSize:14, fontWeight:700, color:"#8b6914", marginBottom:6 }}>ℹ️ Flujo recomendado</h3>
+        <p style={{ fontSize:13, color:"#a07830", lineHeight:1.8, margin:0 }}>
+          1. Haz los cambios desde cualquier dispositivo.<br/>
+          2. Pulsa <strong>Subir cambios</strong> para guardar en la nube.<br/>
+          3. En otros dispositivos, pulsa <strong>Bajar cambios</strong> y recarga.<br/>
+          4. El kiosco siempre carga los datos locales al iniciar.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+export default function AdminPanel({ onClose, menu, setMenu, productOptions, setProductOptions, cats, setCats, homeImages, setHomeImages }) {
   const [tab, setTab] = useState("stats");
 
   const tabs = [
-    { id:"stats",    label:"📊 Estadísticas" },
+    { id:"stats",    label:"📊 Stats" },
     { id:"products", label:"🍽 Productos" },
+    { id:"categories", label:"🗂 Categorías" },
+    { id:"home",     label:"🖼 Home" },
     { id:"options",  label:"⚙️ Opciones" },
-    { id:"promos",   label:"🎁 Promociones" },
-    { id:"config",   label:"⚙️ Config" },
+    { id:"promos",   label:"🎁 Promos" },
+    { id:"config",   label:"☁️ Config" },
   ];
 
   return (
     <div style={{ position:"fixed", inset:0, zIndex:3000, background:"#faf8f4", display:"flex", flexDirection:"column" }}>
       {/* Header */}
-      <header style={{ background:"#1a0f08", padding:"0 28px", height:60, display:"flex", alignItems:"center", justifyContent:"space-between", flexShrink:0 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:16 }}>
-          <div style={{ color:"#e8c99a", fontFamily:"Georgia,serif", fontSize:16, fontWeight:700, letterSpacing:1 }}>KIOSK·IQ — Admin</div>
-          <div style={{ display:"flex", gap:0 }}>
-            {tabs.map(t => (
-              <button key={t.id} onClick={()=>setTab(t.id)} style={{ background: t.id===tab?"rgba(232,201,154,0.15)":"transparent", border:"none", color: t.id===tab?"#e8c99a":"rgba(255,255,255,0.5)", padding:"8px 16px", fontSize:13, cursor:"pointer", borderRadius:8, fontWeight: t.id===tab?700:400, transition:"all 0.15s" }}>
-                {t.label}
-              </button>
-            ))}
-          </div>
-        </div>
-        <button onClick={onClose} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"#fff", borderRadius:10, padding:"8px 18px", fontSize:13, cursor:"pointer", fontWeight:600 }}>
-          ✕ Cerrar admin
-        </button>
+      <header style={{ background:"#1a0f08", padding:"0 20px", display:"flex", alignItems:"center", gap:16, minHeight:56, flexShrink:0 }}>
+        <span style={{ color:"#c0a882", fontFamily:"Georgia,serif", fontWeight:700, fontSize:16, flex:1 }}>Panel Admin — Nomade Kafe</span>
+        <button onClick={onClose} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"#fff", borderRadius:8, padding:"6px 16px", cursor:"pointer", fontSize:13 }}>Cerrar</button>
       </header>
+
+      {/* Tabs */}
+      <div style={{ display:"flex", borderBottom:"2px solid #e8e0d4", background:"#fff", overflowX:"auto", flexShrink:0 }}>
+        {tabs.map(t => (
+          <button key={t.id} onClick={() => setTab(t.id)} style={{
+            padding:"12px 16px", border:"none", background:"none", cursor:"pointer",
+            fontWeight: tab===t.id ? 700 : 400,
+            color: tab===t.id ? "#1a0f08" : "#888",
+            borderBottom: tab===t.id ? "2px solid #3d2b1f" : "2px solid transparent",
+            marginBottom:-2, whiteSpace:"nowrap", fontSize:13,
+          }}>{t.label}</button>
+        ))}
+      </div>
 
       {/* Content */}
       <div style={{ flex:1, overflow:"hidden", display:"flex" }}>
-        {tab==="stats"    && <StatsTab />}
-        {tab==="products" && <ProductsTab menu={menu} setMenu={setMenu} />}
-        {tab==="options"  && <OptionsTab menu={menu} productOptions={productOptions} setProductOptions={setProductOptions} />}
-        {tab==="promos"   && <PromosTab menu={menu} />}
-        {tab==="config"   && <ConfigTab />}
+        {tab==="stats"      && <StatsTab />}
+        {tab==="products"   && <ProductsTab menu={menu} setMenu={setMenu} />}
+        {tab==="categories" && <CategoriesTab cats={cats} setCats={setCats} menu={menu} />}
+        {tab==="home"       && <HomeTab homeImages={homeImages} setHomeImages={setHomeImages} />}
+        {tab==="options"    && <OptionsTab menu={menu} productOptions={productOptions} setProductOptions={setProductOptions} />}
+        {tab==="promos"     && <PromosTab menu={menu} />}
+        {tab==="config"     && <ConfigTab />}
       </div>
     </div>
   );
 }
 
-export { PinScreen, STORAGE_KEYS, loadJSON, saveJSON };
+export { PinScreen, STORAGE_KEYS, loadJSON, saveJSON, gistPull, gistPush };
