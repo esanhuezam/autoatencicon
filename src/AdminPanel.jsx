@@ -11,12 +11,47 @@ const STORAGE_KEYS = {
   orders:    "kiosk_orders",
 };
 
+// ── Storage ──────────────────────────────────────────────────────────────────
+// Los cambios se guardan en localStorage del navegador (el mismo que usa Chrome
+// en la tablet). Para que persistan entre recargas, el kiosco debe correr
+// siempre en el MISMO navegador/dispositivo (no en incógnito).
+//
+// Para restaurar configuración en otro dispositivo:
+// Panel Admin → Configuración → Exportar / Importar datos
+
 function loadJSON(key, fallback) {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
   catch { return fallback; }
 }
 function saveJSON(key, val) {
-  try { localStorage.setItem(key, JSON.stringify(val)); } catch {}
+  try { localStorage.setItem(key, JSON.stringify(val)); }
+  catch {}
+}
+
+// Exporta toda la configuración como archivo .json descargable
+export function exportConfig() {
+  const data = {};
+  for (const [name, key] of Object.entries(STORAGE_KEYS)) {
+    data[name] = loadJSON(key, null);
+  }
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = "nomade-kiosk-config-" + new Date().toISOString().slice(0,10) + ".json";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Importa configuración desde archivo .json
+export function importConfig(jsonStr) {
+  try {
+    const data = JSON.parse(jsonStr);
+    for (const [name, key] of Object.entries(STORAGE_KEYS)) {
+      if (data[name] !== undefined) saveJSON(key, data[name]);
+    }
+    return true;
+  } catch { return false; }
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -576,6 +611,135 @@ function PromosTab({ menu }) {
 }
 
 // ── Main AdminPanel ───────────────────────────────────────────────────────────
+// ── ConfigTab ─────────────────────────────────────────────────────────────────
+function ConfigTab() {
+  const [importStatus, setImportStatus] = useState(null);
+  const fileRef = useRef(null);
+
+  function handleExport() {
+    const data = {};
+    for (const [name, key] of Object.entries(STORAGE_KEYS)) {
+      const v = localStorage.getItem(key);
+      data[name] = v ? JSON.parse(v) : null;
+    }
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href     = url;
+    a.download = "nomade-kiosk-config-" + new Date().toISOString().slice(0,10) + ".json";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function handleImportFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      try {
+        const data = JSON.parse(ev.target.result);
+        let count = 0;
+        for (const [name, key] of Object.entries(STORAGE_KEYS)) {
+          if (data[name] !== undefined && data[name] !== null) {
+            localStorage.setItem(key, JSON.stringify(data[name]));
+            count++;
+          }
+        }
+        setImportStatus({ ok: true, msg: `✓ ${count} categorías importadas. Recarga para ver los cambios.` });
+      } catch {
+        setImportStatus({ ok: false, msg: "✗ Archivo inválido. Usa un archivo exportado desde este kiosco." });
+      }
+    };
+    reader.readAsText(file);
+  }
+
+  function handleReset() {
+    if (!window.confirm("¿Borrar toda la configuración guardada? Los productos vuelven al estado original.")) return;
+    for (const key of Object.values(STORAGE_KEYS)) {
+      localStorage.removeItem(key);
+    }
+    setImportStatus({ ok: true, msg: "✓ Configuración restablecida. Recarga la página." });
+  }
+
+  const cardStyle = {
+    background: "#fff", borderRadius: 16, padding: "28px 28px",
+    marginBottom: 16, boxShadow: "0 2px 12px rgba(0,0,0,0.07)",
+    border: "1px solid #f0ebe3",
+  };
+  const btnStyle = (color) => ({
+    display: "inline-flex", alignItems: "center", gap: 8,
+    padding: "13px 24px", borderRadius: 12, border: "none",
+    background: color, color: "#fff", fontWeight: 700,
+    fontSize: 15, cursor: "pointer", marginRight: 12, marginTop: 8,
+  });
+
+  return (
+    <div style={{ padding: "24px 20px", maxWidth: 600, margin: "0 auto" }}>
+      <h2 style={{ fontFamily:"Georgia,serif", fontSize:22, color:"#1a0f08", marginBottom:24 }}>⚙️ Configuración</h2>
+
+      {/* Exportar */}
+      <div style={cardStyle}>
+        <h3 style={{ fontSize:16, fontWeight:700, color:"#1a0f08", marginBottom:8 }}>📥 Exportar configuración</h3>
+        <p style={{ fontSize:13, color:"#888", marginBottom:16, lineHeight:1.6 }}>
+          Guarda todos los cambios de precios, imágenes y promociones en un archivo .json.
+          Úsalo para restaurar en otro dispositivo o como respaldo.
+        </p>
+        <button onClick={handleExport} style={btnStyle("#3d2b1f")}>
+          📥 Descargar backup
+        </button>
+      </div>
+
+      {/* Importar */}
+      <div style={cardStyle}>
+        <h3 style={{ fontSize:16, fontWeight:700, color:"#1a0f08", marginBottom:8 }}>📤 Importar configuración</h3>
+        <p style={{ fontSize:13, color:"#888", marginBottom:16, lineHeight:1.6 }}>
+          Restaura una configuración guardada. Selecciona el archivo .json exportado anteriormente.
+          <br /><strong style={{ color:"#c0713a" }}>Los datos actuales serán reemplazados.</strong>
+        </p>
+        <button onClick={() => fileRef.current?.click()} style={btnStyle("#c0713a")}>
+          📤 Seleccionar archivo
+        </button>
+        <input ref={fileRef} type="file" accept=".json" onChange={handleImportFile}
+          style={{ display:"none" }} />
+        {importStatus && (
+          <div style={{
+            marginTop: 12, padding: "10px 16px", borderRadius: 10,
+            background: importStatus.ok ? "#e8f5e9" : "#fce4e4",
+            color: importStatus.ok ? "#2e7d32" : "#c62828",
+            fontSize: 13, fontWeight: 600,
+          }}>
+            {importStatus.msg}
+          </div>
+        )}
+      </div>
+
+      {/* Restablecer */}
+      <div style={cardStyle}>
+        <h3 style={{ fontSize:16, fontWeight:700, color:"#1a0f08", marginBottom:8 }}>🗑 Restablecer todo</h3>
+        <p style={{ fontSize:13, color:"#888", marginBottom:16, lineHeight:1.6 }}>
+          Borra toda la configuración guardada y vuelve al estado original del kiosco.
+        </p>
+        <button onClick={handleReset} style={btnStyle("#e05a4a")}>
+          🗑 Restablecer fábrica
+        </button>
+      </div>
+
+      {/* Info */}
+      <div style={{ ...cardStyle, background:"#fdf8f0", borderColor:"#e8d5b7" }}>
+        <h3 style={{ fontSize:15, fontWeight:700, color:"#8b6914", marginBottom:8 }}>ℹ️ Cómo funciona el almacenamiento</h3>
+        <p style={{ fontSize:13, color:"#a07830", lineHeight:1.7, margin:0 }}>
+          Los cambios se guardan en el navegador de <strong>este dispositivo</strong>.<br/>
+          Para usarlos en otra tablet: exporta el archivo aquí e impórtalo allá.<br/>
+          El modo incógnito tiene almacenamiento separado — no uses incógnito para el kiosco.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+
 export default function AdminPanel({ onClose, menu, setMenu, productOptions, setProductOptions }) {
   const [tab, setTab] = useState("stats");
 
@@ -584,6 +748,7 @@ export default function AdminPanel({ onClose, menu, setMenu, productOptions, set
     { id:"products", label:"🍽 Productos" },
     { id:"options",  label:"⚙️ Opciones" },
     { id:"promos",   label:"🎁 Promociones" },
+    { id:"config",   label:"⚙️ Config" },
   ];
 
   return (
@@ -611,6 +776,7 @@ export default function AdminPanel({ onClose, menu, setMenu, productOptions, set
         {tab==="products" && <ProductsTab menu={menu} setMenu={setMenu} />}
         {tab==="options"  && <OptionsTab menu={menu} productOptions={productOptions} setProductOptions={setProductOptions} />}
         {tab==="promos"   && <PromosTab menu={menu} />}
+        {tab==="config"   && <ConfigTab />}
       </div>
     </div>
   );
